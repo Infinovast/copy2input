@@ -60,7 +60,8 @@ class AppTests(unittest.TestCase):
                     self.assertEqual(root.title(), 'Copy2Input')
                     if scale == 1:
                         self.assertLessEqual(root.winfo_width(), 480)
-                        self.assertLessEqual(root.winfo_height(), 670 if advanced else 440)
+                        preview_height = app.clipboard_preview.winfo_reqheight() + 5
+                        self.assertLessEqual(root.winfo_height(), (670 if advanced else 440) + preview_height)
                     texts = []
                     pending = [root]
                     while pending:
@@ -129,6 +130,58 @@ class AppTests(unittest.TestCase):
             root.update_idletasks()
         self.addCleanup(app.flush_pending_settings)
         return root, app
+
+    def test_clipboard_preview_uses_three_rows_and_adapts_to_window_width(self):
+        root, app = self.create_app()
+        root.deiconify()
+        root.update()
+        preview = app.clipboard_preview
+        app.set_clipboard_text('少量文本')
+        self.assertEqual(preview.get('1.0', 'end-1c'), '少量文本')
+        app.set_clipboard_text('开头 ' + '中英文 mixed text ' * 80 + ' 结尾')
+        narrow = preview.get('1.0', 'end-1c')
+        root.geometry(f'{root.winfo_width() + 180}x{root.winfo_height()}')
+        root.update()
+        wide = preview.get('1.0', 'end-1c')
+        self.assertEqual(int(preview.cget('height')), 3)
+        self.assertEqual(preview.cget('state'), tk.DISABLED)
+        for text in (narrow, wide):
+            lines = text.splitlines()
+            self.assertEqual(len(lines), 3)
+            self.assertIn('...', lines[1])
+            self.assertTrue(lines[0].startswith('开头 '))
+            self.assertTrue(lines[-1].endswith(' 结尾'))
+        self.assertGreater(len(wide), len(narrow))
+        app.set_clipboard_text('')
+        self.assertEqual(preview.get('1.0', 'end-1c'), '剪贴板为空')
+
+    def test_clipboard_poll_retries_contention_and_skips_unchanged_text(self):
+        if sys.platform != 'win32':
+            self.skipTest('Windows clipboard sequence numbers')
+        _, app = self.create_app()
+        clipboard = Mock()
+        clipboard.paste.side_effect = [RuntimeError('clipboard busy'), 'long clipboard text ' * 2]
+        user32 = Mock()
+        user32.GetClipboardSequenceNumber.return_value = 10
+        user32.IsClipboardFormatAvailable.return_value = True
+        with patch.object(app.root, 'after'), patch.object(main.ctypes, 'windll', SimpleNamespace(user32=user32)), patch.object(
+            main, 'load_pyperclip', return_value=clipboard
+        ), patch.object(main.threading, 'Thread', side_effect=lambda target, args, daemon:
+                        SimpleNamespace(start=lambda: target(*args))):
+            app.poll_clipboard()
+            app.poll_clipboard()
+            app.poll_clipboard()
+            self.assertTrue(app.clipboard_ready)
+            self.assertEqual(app.clipboard_text, 'long clipboard text long clipboard text')
+            app.poll_clipboard()
+            self.assertEqual(clipboard.paste.call_count, 2)
+            user32.GetClipboardSequenceNumber.return_value = 11
+            user32.IsClipboardFormatAvailable.return_value = False
+            app.poll_clipboard()
+            app.poll_clipboard()
+            self.assertFalse(app.clipboard_ready)
+            self.assertEqual(app.clipboard_text, '')
+            self.assertEqual(clipboard.paste.call_count, 2)
 
     def test_auto_save_coalesces_edits(self):
         root, app = self.create_app()
@@ -398,7 +451,9 @@ class InputTests(unittest.TestCase):
         self.app.pause_reason = None
         self.app.focus_monitor_job = None
         self.app.tray_icon = None
-        self.app.tray_images = {state: object() for state in ('idle', 'typing', 'paused')}
+        self.app.tray_images = {state: object() for state in main.TRAY_TITLES}
+        self.app.clipboard_text = ''
+        self.app.clipboard_ready = False
         self.app.toggle_hotkey_hook = None
         self.app.pause_hotkey_hook = None
         self.app.hook_handle = None
@@ -436,7 +491,7 @@ class InputTests(unittest.TestCase):
                 self.assertEqual(wait.call_count, len(text) - 1)
                 for args in wait.call_args_list:
                     self.assertGreaterEqual(args.args[0], 0)
-                    self.assertLessEqual(args.args[0], 0.5)
+                    self.assertLessEqual(args.args[0], self.app.config['separator_max_delay'] / 1000)
                     self.assertIs(args.args[1], self.app.stop_event)
                 self.assertEqual(self.keyboard.write.call_args_list, [call(char, delay=0, exact=True) for char in text])
                 self.keyboard.press.assert_not_called()
@@ -453,6 +508,62 @@ class InputTests(unittest.TestCase):
                                               for delay in (0.023, 0.3, 0.017)])
         self.assertEqual(self.keyboard.write.call_args_list,
                          [call(char, delay=0, exact=True) for char in 'abcd'])
+
+    def test_symbol_pairs_write_delimiters_then_move_caret_through_nested_content(self):
+        text = 'a{[（“\'x\'”）]}z'
+        self.app.config.update(min_speed=60, max_speed=140, separators='{[（“\'')
+        output = Mock()
+        output.attach_mock(self.keyboard, 'keyboard')
+        with patch.object(self.app, 'wait_for_typing', return_value=True) as wait:
+            output.attach_mock(wait, 'wait')
+            self.app.type_text(text, self.app.stop_event)
+        events = [event for event in self.keyboard.method_calls
+                  if event[0] in ('write', 'press_and_release')]
+        expected = [call.write('a', delay=0, exact=True)]
+        for opening, closing in ('{}', '[]', '（）', '“”', "''"):
+            expected.extend((call.write(opening, delay=0, exact=True),
+                             call.write(closing, delay=0, exact=True),
+                             call.press_and_release('left')))
+        expected.append(call.write('x', delay=0, exact=True))
+        expected.extend([call.press_and_release('right')] * 5)
+        expected.append(call.write('z', delay=0, exact=True))
+        self.assertEqual(events, expected)
+        self.assertEqual(wait.call_count, len(text) - 1 + 5)
+        for opening, closing in ('{}', '[]', '（）', '“”', "''"):
+            index = output.mock_calls.index(call.keyboard.write(opening, delay=0, exact=True))
+            name, args, _ = output.mock_calls[index + 1]
+            self.assertEqual(name, 'wait')
+            self.assertGreaterEqual(args[0], 0.06)
+            self.assertLessEqual(args[0], 0.14)
+            self.assertEqual(output.mock_calls[index + 2], call.keyboard.write(closing, delay=0, exact=True))
+
+    def test_stop_between_paired_symbols_leaves_the_closing_symbol_unsent(self):
+        def stop_during_wait(delay, stop_event):
+            stop_event.set()
+            return False
+
+        with patch.object(self.app, 'wait_for_typing', side_effect=stop_during_wait):
+            self.app.type_text('(x)', self.app.stop_event)
+        self.keyboard.write.assert_called_once_with('(', delay=0, exact=True)
+        self.keyboard.press_and_release.assert_not_called()
+
+    def test_symbol_pair_detection_leaves_apostrophes_escapes_and_distant_symbols_literal(self):
+        limit = main.MAX_PAIR_CONTENT_LENGTH
+        for text, pairs in (
+            ('""', {0: 1}),
+            ('(' + 'x' * limit + ')', {0: limit + 1}),
+            ('(' + 'x' * (limit + 1) + ')', {}),
+            ('[open', {}),
+            ("don't touch the dogs' toys", {}),
+            ('甲‘乙’丙', {1: 3}),
+            ('“don’t”', {0: 6}),
+            ('(")")', {0: 4, 1: 3}),
+            (r'"foo\"bar"', {0: 9}),
+            (r'\(literal\)', {}),
+            (r'\\(pair)', {2: 7}),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(main.find_symbol_pairs(text), pairs)
 
     def test_tray_tracks_typing_pause_resume_stop_and_completion(self):
         self.app.tray_icon = Mock()
@@ -500,8 +611,37 @@ class InputTests(unittest.TestCase):
         for image in self.app.tray_images.values():
             self.assertEqual(image.size, (64, 64))
             self.assertEqual(image.mode, 'RGBA')
+        colors = {'paused': (250, 204, 21, 255), 'typing': (239, 68, 68, 255), 'ready': (34, 197, 94, 255)}
+        for state, color in colors.items():
+            self.assertEqual(self.app.tray_images[state].getpixel((49, 15)), color)
+            for point in ((59, 15), (49, 6)):
+                actual = self.app.tray_images[state].getpixel(point)
+                self.assertLessEqual(max(abs(channel - expected) for channel, expected in zip(actual, color)), 8)
+        self.assertEqual(self.app.tray_images['idle'].getpixel((59, 15))[3], 0)
+        self.assertEqual(self.app.tray_images['idle'].getpixel((49, 6))[3], 0)
         self.assertIs(self.app.tray_icon.icon, self.app.tray_images['paused'])
         self.assertEqual(self.app.tray_icon.title, 'Copy2Input · 已暂停')
+
+    def test_tray_indicates_long_clipboard_only_when_idle(self):
+        self.app.tray_icon = Mock()
+        limit = main.CLIPBOARD_READY_LENGTH
+        with patch.object(self.app, 'render_clipboard_preview'):
+            self.app.update_tray_state()
+            self.app.set_clipboard_text('x' * limit + ' ')
+            self.assertIs(self.app.tray_icon.icon, self.app.tray_images['idle'])
+            self.app.set_clipboard_text('x' * (limit + 1))
+            self.assertIs(self.app.tray_icon.icon, self.app.tray_images['ready'])
+            self.assertEqual(self.app.tray_icon.title, 'Copy2Input · 剪贴板就绪')
+            self.app.is_typing = True
+            self.app.update_tray_state()
+            self.assertIs(self.app.tray_icon.icon, self.app.tray_images['typing'])
+            self.app.toggle_pause()
+            self.app.set_clipboard_text('longer ' * limit)
+            self.assertIs(self.app.tray_icon.icon, self.app.tray_images['paused'])
+            self.app.stop_typing()
+            self.assertIs(self.app.tray_icon.icon, self.app.tray_images['ready'])
+            self.app.set_clipboard_text('')
+            self.assertIs(self.app.tray_icon.icon, self.app.tray_images['idle'])
 
     def test_tray_update_failure_does_not_interrupt_pause_or_stop(self):
         self.app.tray_icon = Mock()
@@ -576,6 +716,34 @@ class InputTests(unittest.TestCase):
         self.assertEqual(self.keyboard.write.call_args_list, [call(char, delay=0, exact=True) for char in 'ab'])
         self.clipboard.paste.assert_called_once()
         self.assertFalse(self.app.is_typing)
+        self.app.status_var.set.assert_called_with('✓ 输入完成')
+
+    def test_focus_loss_after_pair_insertion_pauses_before_moving_caret(self):
+        self.app.config.update(GUARD_DEFAULTS)
+        self.clipboard.paste.return_value = '(x)'
+        original, other = (101, 201), (102, 202)
+        with patch.object(main, 'inspect_foreground_window', return_value=WindowState(original)), patch.object(
+            main, 'foreground_window', return_value=original
+        ) as foreground, patch.object(self.app, 'wait_for_typing', return_value=True):
+            def write(char, **options):
+                if char == ')':
+                    foreground.return_value = other
+
+            self.keyboard.write.side_effect = write
+            self.app.start_typing()
+            with self.app.typing_condition:
+                self.assertTrue(self.app.typing_condition.wait_for(lambda: self.app.is_paused, timeout=1))
+            self.assertEqual(self.keyboard.write.call_args_list,
+                             [call(char, delay=0, exact=True) for char in '()'])
+            self.keyboard.press_and_release.assert_not_called()
+            foreground.return_value = original
+            self.app.toggle_pause()
+            self.app.typing_thread.join(timeout=1)
+            self.assertFalse(self.app.typing_thread.is_alive())
+        self.flush_callbacks()
+        self.assertEqual(self.keyboard.write.call_args_list,
+                         [call(char, delay=0, exact=True) for char in '()x'])
+        self.assertEqual(self.keyboard.press_and_release.call_args_list, [call('left'), call('right')])
         self.app.status_var.set.assert_called_with('✓ 输入完成')
 
     def test_monitor_pauses_during_long_delay_without_automatic_resume(self):
@@ -844,7 +1012,7 @@ class InputTests(unittest.TestCase):
     def test_keyboard_failure_does_not_block_tray(self):
         with patch.object(main, 'load_keyboard', side_effect=ModuleNotFoundError('keyboard')), patch.object(
             main, 'HAS_PYSTRAY', True
-        ), patch.object(self.app, 'setup_tray') as tray:
+        ), patch.object(self.app, 'poll_clipboard'), patch.object(self.app, 'setup_tray') as tray:
             self.app.initialize_background_features()
             tray.assert_called_once()
 
@@ -1030,7 +1198,9 @@ class TypingRhythmTests(unittest.TestCase):
         for index in range(len(text) - 1):
             for rhythm, delays in ((slow, slow_delays), (fast, fast_delays)):
                 delay = rhythm.delay_after(index)
-                lower, upper = ((0.2, 0.5) if index in rhythm.boundaries else (0.05, 0.15))
+                low_key, high_key = (('separator_min_delay', 'separator_max_delay')
+                                     if index in rhythm.boundaries else ('min_speed', 'max_speed'))
+                lower, upper = (INTERVAL_DEFAULTS[key] / 1000 for key in (low_key, high_key))
                 self.assertGreaterEqual(delay, lower)
                 self.assertLessEqual(delay, upper)
                 delays.append(delay)
@@ -1053,7 +1223,8 @@ class TypingRhythmTests(unittest.TestCase):
                 text = 'Hello' + suffix + 'World'
                 rhythm = self.rhythm(text)
                 delays = [rhythm.delay_after(i) for i in range(len(text) - 1)]
-                pauses = [i for i, delay in enumerate(delays) if delay >= 0.2]
+                pauses = [i for i, delay in enumerate(delays)
+                          if delay >= INTERVAL_DEFAULTS['separator_min_delay'] / 1000]
                 self.assertEqual(pauses, [len('Hello' + suffix) - 1])
 
     def test_english_tokens_do_not_trigger_internal_separator_pauses(self):
@@ -1062,9 +1233,11 @@ class TypingRhythmTests(unittest.TestCase):
                       'Dr.', 'e.g.', "don't"):
             with self.subTest(token=token):
                 rhythm = self.rhythm(token)
-                self.assertTrue(all(rhythm.delay_after(i) <= 0.15 for i in range(len(token) - 1)))
+                self.assertTrue(all(rhythm.delay_after(i) <= INTERVAL_DEFAULTS['max_speed'] / 1000
+                                    for i in range(len(token) - 1)))
         rhythm = self.rhythm('https://example.com. Next')
-        self.assertGreaterEqual(rhythm.delay_after(len('https://example.com. ') - 1), 0.2)
+        self.assertGreaterEqual(rhythm.delay_after(len('https://example.com. ') - 1),
+                                INTERVAL_DEFAULTS['separator_min_delay'] / 1000)
 
     def test_boundary_strength_increases_with_sentence_structure(self):
         samples = ('a b', 'a, b', 'a. b', 'a\nb', 'a\n\nb')
@@ -1104,10 +1277,12 @@ class TypingRhythmTests(unittest.TestCase):
         text = 'Hello. World'
         smart = self.rhythm(text)
         literal = self.rhythm(text, model_smart_pauses=False)
-        self.assertLessEqual(smart.delay_after(text.index('.')), 0.15)
-        self.assertGreaterEqual(literal.delay_after(text.index('.')), 0.2)
-        self.assertGreaterEqual(smart.delay_after(text.index(' ')), 0.2)
-        self.assertGreaterEqual(literal.delay_after(text.index(' ')), 0.2)
+        normal_max = INTERVAL_DEFAULTS['max_speed'] / 1000
+        separator_min = INTERVAL_DEFAULTS['separator_min_delay'] / 1000
+        self.assertLessEqual(smart.delay_after(text.index('.')), normal_max)
+        self.assertGreaterEqual(literal.delay_after(text.index('.')), separator_min)
+        self.assertGreaterEqual(smart.delay_after(text.index(' ')), separator_min)
+        self.assertGreaterEqual(literal.delay_after(text.index(' ')), separator_min)
         for smart_pauses in (False, True):
             for token in ('3.14', 'Dr. Smith', 'user_name', 'user.name@example.com'):
                 with self.subTest(smart=smart_pauses, token=token):
@@ -1115,10 +1290,10 @@ class TypingRhythmTests(unittest.TestCase):
                     protected = self.rhythm(token, model_smart_pauses=smart_pauses)
                     unprotected = self.rhythm(token, model_smart_pauses=smart_pauses,
                                              model_english_tokens=False)
-                    self.assertLessEqual(protected.delay_after(index), 0.15)
+                    self.assertLessEqual(protected.delay_after(index), normal_max)
                     # Smart pauses may move punctuation delay onto its following space.
                     end = index + (1 if token[index + 1:index + 2] == ' ' and smart_pauses else 0)
-                    self.assertGreaterEqual(unprotected.delay_after(end), 0.2)
+                    self.assertGreaterEqual(unprotected.delay_after(end), separator_min)
 
     def test_long_sample_outputs_intact_with_all_features_on_and_off(self):
         for enabled in (False, True):
@@ -1134,7 +1309,18 @@ class TypingRhythmTests(unittest.TestCase):
                 keyboard.is_pressed.return_value = False
                 with patch.object(main, 'keyboard', keyboard), patch.object(app, 'wait_for_typing', return_value=True):
                     app.type_text(main.TEST_TEXT, threading.Event())
-                self.assertEqual(''.join(args.args[0] for args in keyboard.write.call_args_list), main.TEST_TEXT)
+                output = []
+                caret = 0
+                for name, args, _ in keyboard.method_calls:
+                    if name == 'write':
+                        output.insert(caret, args[0])
+                        caret += 1
+                    elif name == 'press_and_release':
+                        caret += -1 if args[0] == 'left' else 1
+                    self.assertLessEqual(0, caret)
+                    self.assertLessEqual(caret, len(output))
+                self.assertEqual(''.join(output), main.TEST_TEXT)
+                self.assertEqual(caret, len(output))
 
     def test_delay_limits_zero_custom_separators_and_reproducibility(self):
         text = 'The QUICK fox, 3.14!\r\n\u4e2d\u6587\U0001f642 ' * 30
@@ -1191,8 +1377,8 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('typing_model', bundled)
         self.assertIn('window_guard', bundled)
         paths = {name.replace('\\', '/') for name in archive.toc}
-        for name in ('assets/Copy2Input.ico', 'assets/Copy2Input.png', 'assets/tray-idle.png',
-                     'assets/tray-typing.png', 'assets/tray-paused.png', 'LICENSE'):
+        for name in ('assets/Copy2Input.ico', 'assets/Copy2Input.png', 'LICENSE',
+                     *(f'assets/tray-{state}.png' for state in main.TRAY_TITLES)):
             self.assertIn(name, paths)
             archived_name = next(path for path in archive.toc if path.replace('\\', '/') == name)
             self.assertEqual(archive.extract(archived_name),

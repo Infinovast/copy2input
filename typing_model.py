@@ -10,9 +10,9 @@ import re
 
 INTERVAL_DEFAULTS = {
     'min_speed': 50,
-    'max_speed': 150,
-    'separator_min_delay': 200,
-    'separator_max_delay': 500,
+    'max_speed': 200,
+    'separator_min_delay': 600,
+    'separator_max_delay': 1000,
 }
 DEFAULT_INPUT_SPEED = 50
 
@@ -156,10 +156,10 @@ class TypingRhythm:
             index = end
         return boundaries
 
-    def _character_delay(self, index):
+    def character_delay(self, char, following):
+        """Return the ordinary typing interval in seconds for two adjacent keys."""
         if self.minimum == self.maximum:
-            return self.minimum
-        char, following = self.text[index:index + 2]
+            return self.minimum / 1000
         factor = 1.0
         if self.features['model_tempo']:
             if self.burst_left <= 0:
@@ -190,7 +190,7 @@ class TypingRhythm:
         spread = (self.maximum - self.minimum) / (self.maximum + self.minimum)
         sigma = (0.35 - 0.08 * self.fluency) * spread
         delay = midpoint * factor * self.rng.lognormvariate(-sigma * sigma / 2, sigma)
-        return max(self.minimum, min(self.maximum, delay))
+        return max(self.minimum, min(self.maximum, delay)) / 1000
 
     def delay_after(self, index):
         if index >= len(self.text) - 1:
@@ -210,5 +210,5 @@ class TypingRhythm:
                 self.effort *= 0.7
                 self.target_tempo = 1.0
         else:
-            delay = self._character_delay(index)
+            return self.character_delay(char, self.text[index + 1])
         return delay / 1000

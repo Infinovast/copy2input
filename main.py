@@ -45,6 +45,10 @@ from tkinter import messagebox, ttk, font as tkfont
 import threading
 import json
 import time
+from collections import deque
+from functools import partial
+from queue import Empty, SimpleQueue
+from unicodedata import east_asian_width
 
 from typing_model import (DEFAULT_INPUT_SPEED, INTERVAL_DEFAULTS, MODEL_DEFAULTS,
                           TypingRhythm, normalize_input_speed, speed_profile)
@@ -92,6 +96,14 @@ def resource_path(name):
 
 CONFIG_FILE = get_config_path()
 APP_NAME = "Copy2Input"
+CLIPBOARD_READY_LENGTH = 20
+CLIPBOARD_POLL_MS = 400
+TRAY_TITLES = {
+    'idle': APP_NAME,
+    'ready': f'{APP_NAME} · 剪贴板就绪',
+    'typing': f'{APP_NAME} · 正在输入',
+    'paused': f'{APP_NAME} · 已暂停',
+}
 DEFAULT_CONFIG = {
     **INTERVAL_DEFAULTS,
     "input_speed": DEFAULT_INPUT_SPEED,
@@ -138,6 +150,102 @@ TEST_TEXT = (
 )
 
 INSTANCE_MUTEX_NAME = rf'Local\{APP_NAME}.SingleInstance'
+MAX_PAIR_CONTENT_LENGTH = 80
+QUOTE_ENDS = {
+    '"': '"', "'": "'", '“': '”', '‘': '’', '＂': '＂', '＇': '＇',
+    '「': '」', '『': '』',
+}
+PAIR_ENDS = {
+    **QUOTE_ENDS, '(': ')', '[': ']', '{': '}',
+    '（': '）', '［': '］', '｛': '｝', '【': '】',
+}
+QUOTE_CLOSERS = frozenset(QUOTE_ENDS.values())
+PAIR_CLOSERS = frozenset(PAIR_ENDS.values())
+
+
+def find_symbol_pairs(text):
+    pairs = {}
+    openings = deque()
+    escaped = False
+    for index, char in enumerate(text):
+        if char == '\\':
+            escaped = not escaped
+            continue
+        if escaped:
+            escaped = False
+            continue
+        can_open = char in PAIR_ENDS
+        can_close = char in PAIR_CLOSERS
+        if not (can_open or can_close):
+            continue
+        while openings and index - openings[0][0] > MAX_PAIR_CONTENT_LENGTH + 1:
+            openings.popleft()
+        if char in ("'", '’', '＇'):
+            previous = text[index - 1] if index else ''
+            following = text[index + 1:index + 2]
+            # Ignore apostrophes inside words while allowing quotes next to CJK text.
+            can_open = can_open and not (previous.isalnum() and east_asian_width(previous) not in 'WF')
+            can_close = can_close and not (following.isalnum() and east_asian_width(following) not in 'WF')
+        if can_close:
+            for count, (start, expected) in enumerate(reversed(openings), 1):
+                if expected == char:
+                    pairs[start] = index
+                    # Discard unmatched openings within this pair to prevent crossing pairs.
+                    for _ in range(count):
+                        openings.pop()
+                    can_open = False
+                    break
+                # A bracket inside a quote can only close a bracket within that quote.
+                if expected in QUOTE_CLOSERS and char not in QUOTE_CLOSERS:
+                    break
+        if can_open:
+            openings.append((index, PAIR_ENDS[char]))
+    return pairs
+
+
+def fit_clipboard_slice(text, start, end, width, measure, *, from_end=False):
+    """Find how many characters fit without measuring the entire clipboard."""
+    def fits(length):
+        fragment = text[end - length:end] if from_end else text[start:start + length]
+        return measure(fragment) <= width
+
+    lower, upper = 0, min(1, end - start)
+    while upper < end - start and fits(upper):
+        lower, upper = upper, min(upper * 2, end - start)
+    while lower < upper:
+        middle = (lower + upper + 1) // 2
+        if fits(middle):
+            lower = middle
+        else:
+            upper = middle - 1
+    return lower
+
+
+def format_clipboard_preview(text, width, measure):
+    ellipsis = '...'
+    ellipsis_width = measure(ellipsis)
+    if width < ellipsis_width:
+        return ''
+
+    fit = partial(fit_clipboard_slice, text, measure=measure)
+    end = len(text)
+    lines = []
+    start = 0
+    for _ in range(3):
+        boundary = start + fit(start, end, width)
+        lines.append(text[start:boundary])
+        if boundary == end:
+            return '\n'.join(lines)
+        start = boundary
+
+    head_end = len(lines[0])
+    tail_start = end - fit(head_end, end, width, from_end=True)
+    middle_width = width - ellipsis_width
+    head_middle = head_end + fit(head_end, tail_start, middle_width // 2)
+    tail_middle = tail_start - fit(head_middle, tail_start, middle_width - middle_width // 2, from_end=True)
+    middle = text[head_end:head_middle] + ellipsis + text[tail_middle:tail_start]
+    return '\n'.join((lines[0], middle, text[tail_start:]))
+
 
 def acquire_instance():
     if sys.platform != 'win32':
@@ -200,6 +308,12 @@ class Copy2InputApp:
         self.pressed_keys = set()
         self.tray_icon = None
         self.tray_images = {}
+        self.clipboard_text = ''
+        self.clipboard_ready = False
+        self.clipboard_sequence = None
+        self.clipboard_poll_job = None
+        self.clipboard_reading = False
+        self.clipboard_results = SimpleQueue()
         self.is_hidden = False
         self.hook_handle = None
         self.toggle_hotkey_hook = None
@@ -215,6 +329,7 @@ class Copy2InputApp:
         
     def initialize_background_features(self):
         self.init_keyboard()
+        self.poll_clipboard()
         if HAS_PYSTRAY:
             try:
                 self.setup_tray()
@@ -546,6 +661,64 @@ class Copy2InputApp:
             ttk.Checkbutton(frame, text='关闭时隐藏到托盘', variable=self.hide_to_tray_var, command=self.on_tray_setting_change, style='App.TCheckbutton').grid(row=0, column=0, sticky='w')
         else:
             tk.Label(frame, text="托盘不可用", font=self.font_small, bg='#ffffff', fg='#94a3b8').grid(row=0, column=0, sticky='w')
+
+        self.preview_font = tkfont.Font(root=self.root, font=self.font_small)
+        self.clipboard_preview = tk.Text(
+            frame, height=3, width=1, wrap='none', state=tk.DISABLED, takefocus=False,
+            font=self.preview_font, bg='#f8fafc', fg='#475569', padx=8, pady=5,
+            relief='flat', bd=0, highlightthickness=1, highlightbackground='#dbe3ec',
+        )
+        self.clipboard_preview.grid(row=1, column=0, sticky='ew', pady=(5, 0))
+        self.clipboard_preview.bind('<Configure>', self.render_clipboard_preview)
+
+    def render_clipboard_preview(self, event=None):
+        preview = self.clipboard_preview
+        inset = 2 * (int(preview.cget('padx')) + int(preview.cget('highlightthickness')))
+        width = preview.winfo_width() - inset
+        text = format_clipboard_preview(self.clipboard_text or '剪贴板为空', width, self.preview_font.measure)
+        preview.configure(state=tk.NORMAL)
+        preview.delete('1.0', tk.END)
+        preview.insert('1.0', text)
+        preview.configure(state=tk.DISABLED)
+
+    def set_clipboard_text(self, text):
+        ready = len(text.strip()) > CLIPBOARD_READY_LENGTH
+        if ready != self.clipboard_ready:
+            self.clipboard_ready = ready
+            if not self.is_typing:
+                self.update_tray_state()
+        preview_text = ' '.join(text.split())
+        if preview_text != self.clipboard_text:
+            self.clipboard_text = preview_text
+            self.render_clipboard_preview()
+
+    def read_clipboard_for_preview(self, sequence):
+        try:
+            # CF_UNICODETEXT is also available when Windows can convert plain text to Unicode.
+            if sys.platform == 'win32' and not ctypes.windll.user32.IsClipboardFormatAvailable(13):
+                text = ''
+            else:
+                text = load_pyperclip().paste()
+        except (ImportError, OSError, RuntimeError):
+            text = None
+        self.clipboard_results.put((sequence, text))
+
+    def poll_clipboard(self):
+        self.clipboard_poll_job = self.root.after(CLIPBOARD_POLL_MS, self.poll_clipboard)
+        if self.clipboard_reading:
+            try:
+                sequence, text = self.clipboard_results.get_nowait()
+            except Empty:
+                return
+            self.clipboard_reading = False
+            if text is not None:
+                self.clipboard_sequence = sequence
+                self.set_clipboard_text(text)
+
+        sequence = ctypes.windll.user32.GetClipboardSequenceNumber() if sys.platform == 'win32' else 0
+        if not sequence or sequence != self.clipboard_sequence:
+            self.clipboard_reading = True
+            threading.Thread(target=self.read_clipboard_for_preview, args=(sequence,), daemon=True).start()
     
     def create_status_section(self, parent, row):
         frame = tk.Frame(parent, bg='#17202a', highlightbackground='#17202a', highlightthickness=1, padx=10, pady=6)
@@ -852,6 +1025,19 @@ class Copy2InputApp:
                     remaining -= time.monotonic() - started
         return False
 
+    def send_typing_input(self, send, value, stop_event):
+        while not stop_event.is_set():
+            with self.typing_condition:
+                self.typing_condition.wait_for(lambda: not self.is_paused or stop_event.is_set())
+                if stop_event.is_set():
+                    break
+                reason = self.focus_loss_reason()
+                if not reason:
+                    send(value)
+                    return True
+            self.pause_for_window(stop_event, reason)
+        return False
+
     def type_text(self, text, stop_event):
         completed = False
         error_message = None
@@ -863,6 +1049,17 @@ class Copy2InputApp:
             load_keyboard()
             settings = self.config.copy()
             rhythm = TypingRhythm(text, settings)
+            pairs = find_symbol_pairs(text)
+            closing_indexes = set(pairs.values())
+            # 逐字符按文本写入，避免 @、大写字母等字符被当作按键名解析
+            write = partial(keyboard.write, delay=0, exact=True)
+
+            def move_caret(direction):
+                state = keyboard.stash_state()
+                try:
+                    keyboard.press_and_release(direction)
+                finally:
+                    keyboard.restore_modifiers(state)
             
             # 释放所有修饰键，避免影响输入
             for key in ['alt', 'ctrl', 'shift', 'win']:
@@ -874,19 +1071,20 @@ class Copy2InputApp:
                         return
             
             for index, char in enumerate(text):
-                while not stop_event.is_set():
-                    with self.typing_condition:
-                        self.typing_condition.wait_for(lambda: not self.is_paused or stop_event.is_set())
-                        if stop_event.is_set():
-                            break
-                        reason = self.focus_loss_reason()
-                        if not reason:
-                            # 逐字符按文本写入，避免 @、大写字母等字符被当作按键名解析
-                            keyboard.write(char, delay=0, exact=True)
-                            break
-                    self.pause_for_window(stop_event, reason)
-                if stop_event.is_set():
-                    break
+                if index in pairs:
+                    closing = text[pairs[index]]
+                    if not self.send_typing_input(write, char, stop_event):
+                        return
+                    if not self.wait_for_typing(rhythm.character_delay(char, closing), stop_event):
+                        return
+                    actions = ((write, closing), (move_caret, 'left'))
+                elif index in closing_indexes:
+                    actions = ((move_caret, 'right'),)
+                else:
+                    actions = ((write, char),)
+                for send, value in actions:
+                    if not self.send_typing_input(send, value, stop_event):
+                        return
                 
                 if index + 1 < len(text) and not self.wait_for_typing(rhythm.delay_after(index), stop_event):
                     break
@@ -978,7 +1176,7 @@ class Copy2InputApp:
     
     def create_tray_icon(self):
         pystray_module, Image = load_tray()
-        for state in ('idle', 'typing', 'paused'):
+        for state in TRAY_TITLES:
             with Image.open(resource_path(f'assets/tray-{state}.png')) as image:
                 self.tray_images[state] = image.copy()
         
@@ -998,12 +1196,13 @@ class Copy2InputApp:
     def update_tray_state(self):
         if self.tray_icon is None:
             return
-        state = ('paused' if self.is_paused else 'typing') if self.is_typing else 'idle'
-        title = {'idle': APP_NAME, 'typing': f'{APP_NAME} · 正在输入',
-                 'paused': f'{APP_NAME} · 已暂停'}[state]
+        if self.is_typing:
+            state = 'paused' if self.is_paused else 'typing'
+        else:
+            state = 'ready' if self.clipboard_ready else 'idle'
         try:
             self.tray_icon.icon = self.tray_images[state]
-            self.tray_icon.title = title
+            self.tray_icon.title = TRAY_TITLES[state]
             self.tray_icon.update_menu()
         except Exception as e:
             print(f"更新托盘状态失败: {e}")
@@ -1028,6 +1227,8 @@ class Copy2InputApp:
         self.root.after(0, self.root.deiconify)
     
     def quit_app(self, icon=None, item=None):
+        if self.clipboard_poll_job is not None:
+            self.root.after_cancel(self.clipboard_poll_job)
         self.flush_pending_settings()
         self.stop_typing()
         try:

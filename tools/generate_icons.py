@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw
 
 ASSETS = Path(__file__).resolve().parents[1] / 'assets'
 SCALE = 4
+LIGHT_COLORS = {'ready': '#22c55e', 'typing': '#ef4444', 'paused': '#facc15'}
 
 
 def draw_icon(state='idle', size=256, tray=False):
@@ -35,13 +36,13 @@ def draw_icon(state='idle', size=256, tray=False):
     line(((47, 34), (47, 56)), '#ffffff', stroke)
     line(((41, 56), (53, 56)), '#ffffff', stroke)
 
-    if state != 'idle':
-        draw.ellipse((40 * SCALE, 0, 64 * SCALE - 1, 24 * SCALE - 1),
-                     fill='#dc2626' if state == 'typing' else '#b45309',
-                     outline='#ffffff', width=2 * SCALE)
-        if state == 'paused':
-            for x in (46, 54):
-                rounded((x, 6, x + 4, 18), 0.5, '#ffffff')
+    if tray:
+        tile = image.resize((54 * SCALE, 54 * SCALE), Image.Resampling.LANCZOS)
+        image = Image.new('RGBA', image.size)
+        image.paste(tile, (0, 10 * SCALE))
+        if state in LIGHT_COLORS:
+            ImageDraw.Draw(image).ellipse((34 * SCALE, 0, 64 * SCALE - 1, 30 * SCALE - 1),
+                                          fill=LIGHT_COLORS[state], outline='#ffffff', width=2 * SCALE)
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
@@ -51,7 +52,7 @@ def main():
     base.save(ASSETS / 'Copy2Input.png')
     base.save(ASSETS / 'Copy2Input.ico', sizes=[(size, size) for size in
               (16, 20, 24, 32, 40, 48, 64, 128, 256)])
-    for state in ('idle', 'typing', 'paused'):
+    for state in ('idle', *LIGHT_COLORS):
         draw_icon(state, 64, tray=True).save(ASSETS / f'tray-{state}.png')
 
 
