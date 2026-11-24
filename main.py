@@ -151,9 +151,12 @@ TEST_TEXT = (
 
 INSTANCE_MUTEX_NAME = rf'Local\{APP_NAME}.SingleInstance'
 MAX_PAIR_CONTENT_LENGTH = 80
+PAIR_SYMBOL_EXTRA_DELAY = 0.1
+PAIR_CARET_DELAY = 0.3
+TRIPLE_SINGLE_QUOTE = "'''"
 QUOTE_ENDS = {
     '"': '"', "'": "'", '“': '”', '‘': '’', '＂': '＂', '＇': '＇',
-    '「': '」', '『': '』',
+    '「': '」', '『': '』', TRIPLE_SINGLE_QUOTE: TRIPLE_SINGLE_QUOTE,
 }
 PAIR_ENDS = {
     **QUOTE_ENDS, '(': ')', '[': ']', '{': '}',
@@ -163,22 +166,32 @@ QUOTE_CLOSERS = frozenset(QUOTE_ENDS.values())
 PAIR_CLOSERS = frozenset(PAIR_ENDS.values())
 
 
+def pair_symbol_at(text, index):
+    return TRIPLE_SINGLE_QUOTE if text.startswith(TRIPLE_SINGLE_QUOTE, index) else text[index]
+
+
 def find_symbol_pairs(text):
     pairs = {}
     openings = deque()
     escaped = False
+    symbol_end = 0
     for index, char in enumerate(text):
+        if index < symbol_end:
+            continue
         if char == '\\':
             escaped = not escaped
             continue
         if escaped:
             escaped = False
             continue
+        if char == "'":
+            char = pair_symbol_at(text, index)
+            symbol_end = index + len(char)
         can_open = char in PAIR_ENDS
         can_close = char in PAIR_CLOSERS
         if not (can_open or can_close):
             continue
-        while openings and index - openings[0][0] > MAX_PAIR_CONTENT_LENGTH + 1:
+        while openings and index - openings[0][0] - len(openings[0][1]) > MAX_PAIR_CONTENT_LENGTH:
             openings.popleft()
         if char in ("'", '’', '＇'):
             previous = text[index - 1] if index else ''
@@ -1070,24 +1083,37 @@ class Copy2InputApp:
                     if not self.wait_for_typing(0.1, stop_event):
                         return
             
-            for index, char in enumerate(text):
+            index = 0
+            while index < len(text):
+                symbol = text[index]
+                direction = None
+                if index in pairs or index in closing_indexes:
+                    symbol = pair_symbol_at(text, index)
                 if index in pairs:
-                    closing = text[pairs[index]]
-                    if not self.send_typing_input(write, char, stop_event):
-                        return
-                    if not self.wait_for_typing(rhythm.character_delay(char, closing), stop_event):
-                        return
-                    actions = ((write, closing), (move_caret, 'left'))
+                    delimiters = symbol + PAIR_ENDS[symbol]
+                    for offset, char in enumerate(delimiters):
+                        if offset:
+                            delay = rhythm.character_delay(delimiters[offset - 1], char)
+                            if not self.wait_for_typing(delay + PAIR_SYMBOL_EXTRA_DELAY, stop_event):
+                                return
+                        if not self.send_typing_input(write, char, stop_event):
+                            return
+                    direction = 'left'
                 elif index in closing_indexes:
-                    actions = ((move_caret, 'right'),)
-                else:
-                    actions = ((write, char),)
-                for send, value in actions:
-                    if not self.send_typing_input(send, value, stop_event):
+                    direction = 'right'
+                elif not self.send_typing_input(write, symbol, stop_event):
+                    return
+
+                if direction:
+                    if not self.wait_for_typing(PAIR_CARET_DELAY, stop_event):
                         return
-                
-                if index + 1 < len(text) and not self.wait_for_typing(rhythm.delay_after(index), stop_event):
-                    break
+                    for _ in symbol:
+                        if not self.send_typing_input(move_caret, direction, stop_event):
+                            return
+
+                index += len(symbol)
+                if index < len(text) and not self.wait_for_typing(rhythm.delay_after(index - 1), stop_event):
+                    return
             completed = not stop_event.is_set()
         except Exception as e:
             error_message = str(e)

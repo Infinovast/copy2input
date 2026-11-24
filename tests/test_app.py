@@ -528,14 +528,35 @@ class InputTests(unittest.TestCase):
         expected.extend([call.press_and_release('right')] * 5)
         expected.append(call.write('z', delay=0, exact=True))
         self.assertEqual(events, expected)
-        self.assertEqual(wait.call_count, len(text) - 1 + 5)
+        self.assertEqual(wait.call_count, len(text) - 1 + 3 * 5)
         for opening, closing in ('{}', '[]', '（）', '“”', "''"):
             index = output.mock_calls.index(call.keyboard.write(opening, delay=0, exact=True))
             name, args, _ = output.mock_calls[index + 1]
             self.assertEqual(name, 'wait')
-            self.assertGreaterEqual(args[0], 0.06)
-            self.assertLessEqual(args[0], 0.14)
+            self.assertGreaterEqual(args[0], 0.06 + main.PAIR_SYMBOL_EXTRA_DELAY)
+            self.assertLessEqual(args[0], 0.14 + main.PAIR_SYMBOL_EXTRA_DELAY)
             self.assertEqual(output.mock_calls[index + 2], call.keyboard.write(closing, delay=0, exact=True))
+
+    def test_triple_single_quotes_wait_between_symbols_and_before_both_caret_moves(self):
+        self.app.config.update(min_speed=70, max_speed=70, separators='')
+        output = Mock()
+        output.attach_mock(self.keyboard, 'keyboard')
+        with patch.object(self.app, 'wait_for_typing', return_value=True) as wait:
+            output.attach_mock(wait, 'wait')
+            self.app.type_text("'''x'''", self.app.stop_event)
+
+        events = [event for event in output.mock_calls
+                  if event[0] in ('keyboard.write', 'keyboard.press_and_release', 'wait')]
+        quote = call.keyboard.write("'", delay=0, exact=True)
+        symbol_wait = call.wait(0.07 + main.PAIR_SYMBOL_EXTRA_DELAY, self.app.stop_event)
+        caret_wait = call.wait(main.PAIR_CARET_DELAY, self.app.stop_event)
+        content_wait = call.wait(0.07, self.app.stop_event)
+        self.assertEqual(events, [
+            quote, *[symbol_wait, quote] * 5,
+            caret_wait, *[call.keyboard.press_and_release('left')] * 3,
+            content_wait, call.keyboard.write('x', delay=0, exact=True), content_wait,
+            caret_wait, *[call.keyboard.press_and_release('right')] * 3,
+        ])
 
     def test_stop_between_paired_symbols_leaves_the_closing_symbol_unsent(self):
         def stop_during_wait(delay, stop_event):
@@ -553,6 +574,12 @@ class InputTests(unittest.TestCase):
             ('""', {0: 1}),
             ('(' + 'x' * limit + ')', {0: limit + 1}),
             ('(' + 'x' * (limit + 1) + ')', {}),
+            ("''''''", {0: 3}),
+            ("('''a''')", {0: 8, 1: 5}),
+            ("'''It's ok\nnext line'''", {0: 20}),
+            ("'''" + 'x' * limit + "'''", {0: limit + 3}),
+            ("'''" + 'x' * (limit + 1) + "'''", {}),
+            ("'''open", {}),
             ('[open', {}),
             ("don't touch the dogs' toys", {}),
             ('甲‘乙’丙', {1: 3}),
